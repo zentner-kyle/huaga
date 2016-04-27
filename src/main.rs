@@ -1,5 +1,6 @@
 extern crate gtk;
 extern crate gdk;
+extern crate glib;
 extern crate gdk_pixbuf;
 
 use std::path::{PathBuf};
@@ -7,12 +8,14 @@ use std::sync::{Mutex};
 use gtk::prelude::*;
 
 use gtk::{Button, Window, WindowType};
-use gdk_pixbuf::{Pixbuf};
+use gdk_pixbuf::{Pixbuf, PixbufAnimation, PixbufAnimationIter, PixbufAnimationExt};
 
 struct ViewState {
     zoom: f64,
     applied_zoom: f64,
     pixbuf: Option<Pixbuf>,
+    animated_pixbuf: Option<PixbufAnimation>,
+    animated_pixbuf_iter: Option<PixbufAnimationIter>,
     window: gtk::Window,
     image: gtk::Image,
 }
@@ -53,6 +56,8 @@ fn main() {
         zoom: 1.0,
         applied_zoom: 1.0,
         pixbuf: None,
+        animated_pixbuf: None,
+        animated_pixbuf_iter: None,
         window: window.clone(),
         image: image.clone(),
     });
@@ -70,8 +75,18 @@ fn main() {
             match load_pixbuf(file_chooser.get_filename()) {
                 Ok(loaded_pixbuf) => {
                     let mut view = view1.lock().unwrap();
-                    view.pixbuf = Some(loaded_pixbuf.clone());
-                    update_image(&view.image, &loaded_pixbuf, view.zoom).ok();
+                    if loaded_pixbuf.is_static_image() {
+                        let pixbuf = loaded_pixbuf.get_static_image().expect("it said it was static");
+                        view.pixbuf = Some(pixbuf.clone());
+                        view.animated_pixbuf = None;
+                        view.animated_pixbuf_iter = None;
+                        update_image(&view.image, &pixbuf, view.zoom).ok();
+                    } else {
+                        let iter = loaded_pixbuf.get_iter(&glib::get_current_time());
+                        view.animated_pixbuf = Some(loaded_pixbuf.clone());
+                        view.animated_pixbuf_iter = Some(iter.clone());
+                        view.pixbuf = Some(iter.get_pixbuf());
+                    }
                 },
                 Err(_) => {},
             }
@@ -100,8 +115,15 @@ fn main() {
     let view3 = view;
     gtk::timeout_add(20, move || {
         let mut view = view3.lock().unwrap();
-        if view.applied_zoom != view.zoom {
-            let image = view.image.clone();
+        let mut must_update = false;
+        if let Some(ref iter) = view.animated_pixbuf_iter.clone() {
+            if iter.advance(&glib::get_current_time()) {
+                view.pixbuf = Some(iter.get_pixbuf());
+                must_update = true;
+            }
+        }
+        let image = view.image.clone();
+        if view.applied_zoom != view.zoom || must_update {
             if let Some(ref pixbuf) = view.pixbuf {
                 update_image(&image, &pixbuf, view.zoom).ok();
             }
@@ -119,10 +141,10 @@ fn main() {
     gtk::main();
 }
 
-fn load_pixbuf(filepath: Option<PathBuf>) -> Result<Pixbuf, ()> {
+fn load_pixbuf(filepath: Option<PathBuf>) -> Result<PixbufAnimation, ()> {
     let filepath = try!(filepath.ok_or(()));
     let filename = try!(filepath.to_str().ok_or(()));
-    let loaded = try!(Pixbuf::new_from_file(filename).map_err(|_| ()));
+    let loaded = try!(PixbufAnimation::new_from_file(filename).map_err(|_| ()));
     Ok(loaded.clone())
 }
 
