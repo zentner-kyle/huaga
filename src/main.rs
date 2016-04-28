@@ -5,14 +5,17 @@ extern crate gdk_pixbuf;
 
 use std::path::{PathBuf};
 use std::sync::{Mutex};
+use std::cmp;
+use std::f64;
+use std::i32;
 use gtk::prelude::*;
 
 use gtk::{Button, Window, WindowType};
 use gdk_pixbuf::{Pixbuf, PixbufAnimation, PixbufAnimationIter, PixbufAnimationExt};
 
 struct ViewState {
-    zoom: f64,
-    applied_zoom: f64,
+    image_min_size: i32,
+    image_dirty: bool,
     pixbuf: Option<Pixbuf>,
     animated_pixbuf: Option<PixbufAnimation>,
     animated_pixbuf_iter: Option<PixbufAnimationIter>,
@@ -53,8 +56,8 @@ fn main() {
     window.add(&vbox);
 
     let view = static_mutex(ViewState{
-        zoom: 1.0,
-        applied_zoom: 1.0,
+        image_min_size: 0i32,
+        image_dirty: false,
         pixbuf: None,
         animated_pixbuf: None,
         animated_pixbuf_iter: None,
@@ -80,13 +83,17 @@ fn main() {
                         view.pixbuf = Some(pixbuf.clone());
                         view.animated_pixbuf = None;
                         view.animated_pixbuf_iter = None;
-                        update_image(&view.image, &pixbuf, view.zoom).ok();
                     } else {
                         let iter = loaded_pixbuf.get_iter(&glib::get_current_time());
                         view.animated_pixbuf = Some(loaded_pixbuf.clone());
                         view.animated_pixbuf_iter = Some(iter.clone());
                         view.pixbuf = Some(iter.get_pixbuf());
                     }
+                    if view.image_min_size == 0 {
+                        let min_size = { pixbuf_min_size(&view.pixbuf.clone().unwrap()) };
+                        view.image_min_size = min_size;
+                    }
+                    update_image(&view.image, &view.pixbuf.clone().unwrap(), view.image_min_size).ok();
                 },
                 Err(_) => {},
             }
@@ -99,12 +106,25 @@ fn main() {
     scroll.connect_scroll_event(move |_, evt| {
         if evt.get_state().contains(gdk::enums::modifier_type::ControlMask) {
             let mut view = view2.lock().unwrap();
-            view.zoom = view.zoom - evt.get_delta().1 * 0.02;
-            if view.zoom < 0.1f64 {
-                view.zoom = 0.1f64;
-            }
-            if view.zoom > 3f64 {
-                view.zoom = 3f64;
+            let delta = -evt.get_delta().1;
+            if let Some(ref pixbuf) = view.pixbuf.clone() {
+                let pixbuf_size = pixbuf_min_size(pixbuf);
+                let ratio = pixbuf_size as f64 / view.image_min_size as f64;
+                let dratio = delta as f64 / view.image_min_size as f64;
+                let min = 0.1f64;
+                let max = 4.0f64;
+                let dzoom = 0.03 * dzoom_from_dratio(ratio,
+                                              dratio,
+                                              f64::min(ratio, min),
+                                              f64::max(ratio, max));
+                let diff = view.image_min_size as f64 * dzoom;
+                let new_image_min_size = clip_f64(std::i32::MIN as f64, view.image_min_size as f64 + diff, std::i32::MAX as f64);
+                if diff.is_sign_positive() {
+                    view.image_min_size = f64::min(max * view.image_min_size as f64, new_image_min_size) as i32;
+                } else {
+                    view.image_min_size = f64::max(min * view.image_min_size as f64, new_image_min_size) as i32;
+                }
+                view.image_dirty = true;
             }
             gtk::Inhibit(true)
         } else {
@@ -123,11 +143,11 @@ fn main() {
             }
         }
         let image = view.image.clone();
-        if view.applied_zoom != view.zoom || must_update {
+        if view.image_dirty || must_update {
             if let Some(ref pixbuf) = view.pixbuf {
-                update_image(&image, &pixbuf, view.zoom).ok();
+                update_image(&image, &pixbuf, view.image_min_size).ok();
             }
-            view.applied_zoom = view.zoom;
+            view.image_dirty = false;
         }
         gtk::Continue(true)
     });
@@ -148,7 +168,9 @@ fn load_pixbuf(filepath: Option<PathBuf>) -> Result<PixbufAnimation, ()> {
     Ok(loaded.clone())
 }
 
-fn update_image(image: &gtk::Image, pixbuf: &Pixbuf, zoom: f64) -> Result<(), ()> {
+fn update_image(image: &gtk::Image, pixbuf: &Pixbuf, image_min_size: i32) -> Result<(), ()> {
+    let pixbuf_min_size = cmp::max(1, pixbuf_min_size(pixbuf));
+    let zoom: f64 = image_min_size as f64 / pixbuf_min_size as f64;
     let scaled_width = (pixbuf.get_width() as f64 * zoom) as i32;
     let scaled_height = (pixbuf.get_height() as f64 * zoom) as i32;
     if scaled_width <= 0 || scaled_height <= 0 {
@@ -159,5 +181,29 @@ fn update_image(image: &gtk::Image, pixbuf: &Pixbuf, zoom: f64) -> Result<(), ()
         return Ok(());
     } else {
         return Err(());
+    }
+}
+
+fn pixbuf_min_size(pixbuf: &Pixbuf) -> i32 {
+    cmp::min(pixbuf.get_width(), pixbuf.get_height())
+}
+
+fn clip_f64(min: f64, val: f64, max: f64) -> f64 {
+    f64::min(max, f64::max(min, val))
+}
+
+fn dzoom_from_dratio(ratio: f64, dratio: f64, min: f64, max: f64) -> f64 {
+    // We would like the differential to become zero at min and max.
+    // We'll use an inverted hyperbolic.
+    let direction = dratio.signum();
+    let mut hyper = 1f64 - 1f64/((ratio - min) * (max - ratio));
+    if hyper < 0.1f64 {
+        hyper = 0f64;
+    }
+    // If dratio is pushing us more towards ratio == 1.
+    if ((ratio - 1.0f64) * dratio).is_sign_positive() {
+        direction
+    } else {
+        direction * hyper
     }
 }
