@@ -3,23 +3,24 @@ extern crate gdk;
 extern crate glib;
 extern crate gdk_pixbuf;
 
-use std::path::{PathBuf};
-use std::sync::{Mutex};
 use std::cmp;
 use std::f64;
 use std::i32;
+use std::path::{PathBuf};
+use std::sync::{Mutex};
+
 use gtk::prelude::*;
 
-use gtk::{Button, Window, WindowType};
+use gtk::{Window, WindowType};
 use gdk_pixbuf::{Pixbuf, PixbufAnimation, PixbufAnimationIter, PixbufAnimationExt};
 
 struct ViewState {
     image_min_size: i32,
     image_dirty: bool,
+    image_path: Option<PathBuf>,
     pixbuf: Option<Pixbuf>,
     animated_pixbuf: Option<PixbufAnimation>,
     animated_pixbuf_iter: Option<PixbufAnimationIter>,
-    window: gtk::Window,
     image: gtk::Image,
 }
 
@@ -58,14 +59,13 @@ fn main() {
     let view = static_mutex(ViewState{
         image_min_size: 0i32,
         image_dirty: false,
+        image_path: None,
         pixbuf: None,
         animated_pixbuf: None,
         animated_pixbuf_iter: None,
-        window: window.clone(),
         image: image.clone(),
     });
 
-    let view1 = view;
     let window1 = window.clone();
     open_button.connect_clicked(move |_| {
         let file_chooser = gtk::FileChooserDialog::new(
@@ -75,37 +75,16 @@ fn main() {
             ("Cancel", gtk::ResponseType::Cancel as i32),
         ]);
         if file_chooser.run() == gtk::ResponseType::Ok as i32 {
-            match load_pixbuf(file_chooser.get_filename()) {
-                Ok(loaded_pixbuf) => {
-                    let mut view = view1.lock().unwrap();
-                    if loaded_pixbuf.is_static_image() {
-                        let pixbuf = loaded_pixbuf.get_static_image().expect("it said it was static");
-                        view.pixbuf = Some(pixbuf.clone());
-                        view.animated_pixbuf = None;
-                        view.animated_pixbuf_iter = None;
-                    } else {
-                        let iter = loaded_pixbuf.get_iter(&glib::get_current_time());
-                        view.animated_pixbuf = Some(loaded_pixbuf.clone());
-                        view.animated_pixbuf_iter = Some(iter.clone());
-                        view.pixbuf = Some(iter.get_pixbuf());
-                    }
-                    if view.image_min_size == 0 {
-                        let min_size = { pixbuf_min_size(&view.pixbuf.clone().unwrap()) };
-                        view.image_min_size = min_size;
-                    }
-                    update_image(&view.image, &view.pixbuf.clone().unwrap(), view.image_min_size).ok();
-                },
-                Err(_) => {},
-            }
+            let mut view = view.lock().unwrap();
+            do_load_pixbuf(&mut view, &file_chooser.get_filename()).ok();
         }
 
         file_chooser.destroy();
     });
 
-    let view2 = view;
     scroll.connect_scroll_event(move |_, evt| {
         if evt.get_state().contains(gdk::enums::modifier_type::ControlMask) {
-            let mut view = view2.lock().unwrap();
+            let mut view = view.lock().unwrap();
             let delta = -evt.get_delta().1;
             if let Some(ref pixbuf) = view.pixbuf.clone() {
                 let pixbuf_size = pixbuf_min_size(pixbuf);
@@ -132,9 +111,8 @@ fn main() {
         }
     });
 
-    let view3 = view;
     gtk::timeout_add(20, move || {
-        let mut view = view3.lock().unwrap();
+        let mut view = view.lock().unwrap();
         let mut must_update = false;
         if let Some(ref iter) = view.animated_pixbuf_iter.clone() {
             if iter.advance(&glib::get_current_time()) {
@@ -152,6 +130,26 @@ fn main() {
         gtk::Continue(true)
     });
 
+    window.connect_button_press_event(move |_, evt| {
+        let mut view = view.lock().unwrap();
+        if evt.get_event_type() == gdk::EventType::ButtonPress {
+            if evt.get_state().contains(gdk::enums::modifier_type::Button2Mask) ||
+            evt.get_state().contains(gdk::enums::modifier_type::ShiftMask) {
+                if let Err(e) = load_prev_image(&mut view) {
+                    println!("Error loading image: {}", e);
+                }
+                Inhibit(true)
+            } else {
+                if let Err(e) = load_next_image(&mut view) {
+                    println!("Error loading image: {}", e);
+                }
+                Inhibit(true)
+            }
+        } else {
+            Inhibit(false)
+        }
+    });
+
     window.connect_delete_event(|_, _| {
         gtk::main_quit();
         Inhibit(false)
@@ -161,8 +159,76 @@ fn main() {
     gtk::main();
 }
 
-fn load_pixbuf(filepath: Option<PathBuf>) -> Result<PixbufAnimation, ()> {
-    let filepath = try!(filepath.ok_or(()));
+fn nearby_files(image_path: &Option<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    let image_path = try!(image_path.clone().ok_or("Bad initial image path".to_owned()));
+    let parent = try!(image_path.parent().ok_or("image doesn't exist in directory".to_owned()));
+    let dir = try!(std::fs::read_dir(parent).map_err(|_| "Could not open directory for reading".to_owned()));
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    let mut found = false;
+    for entry in dir {
+        let entry = try!(entry.map_err(|_| "bad directory entry".to_owned()));
+        let path = entry.path();
+        if path == image_path {
+            found = true;
+            before.push(path);
+            continue;
+        }
+        if found {
+            after.push(path);
+        } else {
+            before.push(path);
+        }
+    }
+    after.extend_from_slice(before.as_slice());
+    return Ok(after);
+}
+
+fn load_next_image(view: &mut ViewState) -> Result<(), String> {
+    let nearby = try!(nearby_files(&view.image_path));
+    for file in nearby {
+        if let Ok(_) = do_load_pixbuf(view, &Some(file)) {
+            return Ok(());
+        }
+    }
+    return Err("Could not load any files.".to_owned());
+}
+
+fn load_prev_image(view: &mut ViewState) -> Result<(), String> {
+    let nearby = try!(nearby_files(&view.image_path));
+    for i in 0..nearby.len() {
+        let file = nearby[(2 * nearby.len() - i - 2) % nearby.len()].clone();
+        if let Ok(_) = do_load_pixbuf(view, &Some(file)) {
+            return Ok(());
+        }
+    }
+    return Err("Could not load any files.".to_owned());
+}
+
+
+fn do_load_pixbuf(view: &mut ViewState, path: &Option<PathBuf>) -> Result<(), ()> {
+    let loaded_pixbuf = { try!(load_pixbuf(&path)) };
+    if loaded_pixbuf.is_static_image() {
+        let pixbuf = loaded_pixbuf.get_static_image().expect("it said it was static");
+        view.pixbuf = Some(pixbuf.clone());
+        view.animated_pixbuf = None;
+        view.animated_pixbuf_iter = None;
+    } else {
+        let iter = loaded_pixbuf.get_iter(&glib::get_current_time());
+        view.animated_pixbuf = Some(loaded_pixbuf.clone());
+        view.animated_pixbuf_iter = Some(iter.clone());
+        view.pixbuf = Some(iter.get_pixbuf());
+    }
+    view.image_path = path.clone();
+    if view.image_min_size == 0 {
+        let min_size = { pixbuf_min_size(&view.pixbuf.clone().unwrap()) };
+        view.image_min_size = min_size;
+    }
+    update_image(&view.image, &view.pixbuf.clone().unwrap(), view.image_min_size)
+}
+
+fn load_pixbuf(filepath: &Option<PathBuf>) -> Result<PixbufAnimation, ()> {
+    let filepath = try!(filepath.clone().ok_or(()));
     let filename = try!(filepath.to_str().ok_or(()));
     let loaded = try!(PixbufAnimation::new_from_file(filename).map_err(|_| ()));
     Ok(loaded.clone())
