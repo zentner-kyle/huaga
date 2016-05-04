@@ -50,12 +50,33 @@ fn main() {
     let scroll = gtk::ScrolledWindow::new(None, None);
     scroll.add(&image);
 
+
     let event_box = gtk::EventBox::new();
     event_box.add(&scroll);
 
+    let tree_model = gtk::ListStore::new(&[gtk::Type::String]);
+
+    let tree_view = gtk::TreeView::new_with_model(&tree_model);
+    let tree_view_name_column = gtk::TreeViewColumn::new();
+    let name_cell = gtk::CellRendererText::new();
+    tree_view_name_column.pack_start(&name_cell, true);
+    tree_view_name_column.add_attribute(&name_cell, "text", 0);
+    tree_view.append_column(&tree_view_name_column);
+
+    let tree_view_scroll = gtk::ScrolledWindow::new(None, None);
+    tree_view_scroll.add(&tree_view);
+
+    let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+    let tree_view_frame = gtk::Frame::new(None);
+    tree_view_frame.add(&tree_view_scroll);
+    paned.pack1(&tree_view_frame, false, true);
+    let event_box_frame = gtk::Frame::new(None);
+    event_box_frame.add(&event_box);
+    paned.pack2(&event_box_frame, true, false);
+
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     vbox.pack_start(&toolbar, false, true, 0);
-    vbox.pack_start(&event_box, true, true, 0);
+    vbox.pack_start(&paned, true, true, 0);
 
     window.add(&vbox);
 
@@ -70,6 +91,7 @@ fn main() {
     });
 
     let window1 = window.clone();
+    let tree_view1 = tree_view.clone();
     open_button.connect_clicked(move |_| {
         let file_chooser = gtk::FileChooserDialog::new(
             Some("Open File"), Some(&window1), gtk::FileChooserAction::Open);
@@ -78,11 +100,38 @@ fn main() {
             ("Cancel", gtk::ResponseType::Cancel as i32),
         ]);
         if file_chooser.run() == gtk::ResponseType::Ok as i32 {
-            let mut view = view.lock().unwrap();
-            do_load_pixbuf(&mut view, &file_chooser.get_filename()).ok();
+            {
+                let mut view = view.lock().unwrap();
+                do_load_pixbuf(&mut view, &file_chooser.get_filename()).ok();
+            }
+            if let Ok(files) = files_in_dir_width_image(&file_chooser.get_filename()) {
+                tree_model.clear();
+                for file in files {
+                    if let Some(s) = file.file_name() {
+                        if let Some(s) = s.to_str() {
+                            tree_model.insert_with_values(None, &[0], &[&s.to_owned()]);
+                        }
+                    }
+                }
+                tree_view1.show_all();
+            }
         }
 
         file_chooser.destroy();
+    });
+
+    // tree_view.connect_row_activated(move |_, tree_path, _| {
+    //     println!("row activated!");
+    //     println!("path = {:?}", tree_path.get_indices());
+    // });
+    let tree_view2 = tree_view.clone();
+    tree_view.connect_cursor_changed(move |_| {
+        if let Some((model, iter)) = tree_view2.get_selection().get_selected() {
+            let name = model.get_value(&iter, 0).get::<String>().unwrap();
+            let mut view = view.lock().unwrap();
+            let path = view.image_path.as_ref().unwrap().parent().unwrap().join(&name);
+            do_load_pixbuf(&mut view, &Some(path)).ok();
+        }
     });
 
     scroll.connect_scroll_event(move |_, evt| {
@@ -91,9 +140,9 @@ fn main() {
             let mut delta = -evt.get_delta().1;
             if delta == 0f64 {
                 if evt.as_ref().direction == gdk::ScrollDirection::Down {
-                    delta = 50f64;
+                    delta = -1000f64;
                 } else if evt.as_ref().direction == gdk::ScrollDirection::Up {
-                    delta = -50f64;
+                    delta = 1000f64;
                 } else {
                     return gtk::Inhibit(false);
                 }
@@ -170,6 +219,19 @@ fn main() {
 
     window.show_all();
     gtk::main();
+}
+
+fn files_in_dir_width_image(image_path: &Option<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    let image_path = try!(image_path.clone().ok_or("Bad initial image path".to_owned()));
+    let parent = try!(image_path.parent().ok_or("image doesn't exist in directory".to_owned()));
+    let dir = try!(std::fs::read_dir(parent).map_err(|_| "Could not open directory for reading".to_owned()));
+    let mut files = Vec::new();
+    for entry in dir {
+        let entry = try!(entry.map_err(|_| "bad directory entry".to_owned()));
+        let path = entry.path();
+        files.push(path);
+    }
+    return Ok(files);
 }
 
 fn nearby_files(image_path: &Option<PathBuf>) -> Result<Vec<PathBuf>, String> {
