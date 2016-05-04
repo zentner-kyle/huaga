@@ -50,9 +50,12 @@ fn main() {
     let scroll = gtk::ScrolledWindow::new(None, None);
     scroll.add(&image);
 
+    let event_box = gtk::EventBox::new();
+    event_box.add(&scroll);
+
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     vbox.pack_start(&toolbar, false, true, 0);
-    vbox.pack_start(&scroll, true, true, 0);
+    vbox.pack_start(&event_box, true, true, 0);
 
     window.add(&vbox);
 
@@ -85,7 +88,16 @@ fn main() {
     scroll.connect_scroll_event(move |_, evt| {
         if evt.get_state().contains(gdk::enums::modifier_type::ControlMask) {
             let mut view = view.lock().unwrap();
-            let delta = -evt.get_delta().1;
+            let mut delta = -evt.get_delta().1;
+            if delta == 0f64 {
+                if evt.as_ref().direction == gdk::ScrollDirection::Down {
+                    delta = 50f64;
+                } else if evt.as_ref().direction == gdk::ScrollDirection::Up {
+                    delta = -50f64;
+                } else {
+                    return gtk::Inhibit(false);
+                }
+            }
             if let Some(ref pixbuf) = view.pixbuf.clone() {
                 let pixbuf_size = pixbuf_min_size(pixbuf);
                 let ratio = pixbuf_size as f64 / view.image_min_size as f64;
@@ -97,7 +109,7 @@ fn main() {
                                               f64::min(ratio, min),
                                               f64::max(ratio, max));
                 let diff = view.image_min_size as f64 * dzoom;
-                let new_image_min_size = clip_f64(std::i32::MIN as f64, view.image_min_size as f64 + diff, std::i32::MAX as f64);
+                let new_image_min_size = clip_f64((std::i32::MIN + 1i32) as f64, view.image_min_size as f64 + diff, std::i32::MAX as f64);
                 if diff.is_sign_positive() {
                     view.image_min_size = f64::min(max * view.image_min_size as f64, new_image_min_size) as i32;
                 } else {
@@ -130,21 +142,22 @@ fn main() {
         gtk::Continue(true)
     });
 
-    window.connect_button_press_event(move |_, evt| {
+    event_box.connect_button_press_event(move |_, evt| {
         let mut view = view.lock().unwrap();
         if evt.get_event_type() == gdk::EventType::ButtonPress {
-            if evt.get_state().contains(gdk::enums::modifier_type::Button2Mask) ||
-            evt.get_state().contains(gdk::enums::modifier_type::ShiftMask) {
+            if evt.as_ref().button == 3 || evt.get_state().contains(gdk::enums::modifier_type::ShiftMask) {
                 if let Err(e) = load_prev_image(&mut view) {
                     println!("Error loading image: {}", e);
                 }
-                Inhibit(true)
             } else {
                 if let Err(e) = load_next_image(&mut view) {
                     println!("Error loading image: {}", e);
                 }
-                Inhibit(true)
             }
+            if let Some(adjustment) = scroll.get_vadjustment() {
+                adjustment.set_value(0f64);
+            }
+            Inhibit(true)
         } else {
             Inhibit(false)
         }
